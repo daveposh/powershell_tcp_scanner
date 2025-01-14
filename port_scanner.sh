@@ -407,7 +407,19 @@ read -p "Select output option (1-3): " file_choice
 
 case $file_choice in
     2|3)
-        OUTPUT_FILE="scan_results_$(date +%Y%m%d_%H%M%S).txt"
+        # Use current directory for output
+        OUTPUT_FILE="./scan_results_$(date +%Y%m%d_%H%M%S).txt"
+        
+        # Try to create the file
+        touch "$OUTPUT_FILE" 2>/dev/null
+        
+        # Verify file exists and is writable
+        if [ ! -f "$OUTPUT_FILE" ] || [ ! -w "$OUTPUT_FILE" ]; then
+            echo "Error: Cannot create or write to output file. Check permissions."
+            exit 1
+        fi
+        
+        echo "Results will be saved to: $OUTPUT_FILE"
         ;;
 esac
 
