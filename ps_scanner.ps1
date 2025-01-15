@@ -395,6 +395,24 @@ function Test-HostConnection {
     $openPorts = @()
     $results = @()
 
+    # Test if host responds to ping first
+    try {
+        $ping = New-Object System.Net.NetworkInformation.Ping
+        $result = $ping.Send($HostName, 1000)
+        if ($result.Status -ne 'Success') {
+            if (-not $global:scanOptions.MinimalOutput) {
+                Write-Host "Host $HostName is not responding to ping" -ForegroundColor Yellow
+            }
+            return
+        }
+    }
+    catch {
+        if (-not $global:scanOptions.MinimalOutput) {
+            Write-Host "Error pinging $HostName" -ForegroundColor Red
+        }
+        return
+    }
+
     # Always show scanning message regardless of minimal output
     Write-Host "`nScanning $HostName..." -ForegroundColor Cyan
     
@@ -407,13 +425,12 @@ function Test-HostConnection {
         
         try {
             $tcpClient = New-Object System.Net.Sockets.TcpClient
-            
-            # Create connection timeout task
-            $connectTask = $tcpClient.BeginConnect($HostName, $Port, $null, $null)
-            $wait = $connectTask.AsyncWaitHandle.WaitOne($global:scanOptions.TimeoutMS, $false)
+            $connect = $tcpClient.BeginConnect($HostName, $Port, $null, $null)
+            $wait = $connect.AsyncWaitHandle.WaitOne($global:scanOptions.TimeoutMS, $false)
             
             if ($wait) {
-                if ($tcpClient.Connected) {
+                try {
+                    $tcpClient.EndConnect($connect)
                     $hasOpenPorts = $true
                     $openPorts += $Port
                     
@@ -430,71 +447,40 @@ function Test-HostConnection {
                             "Port $Port$portDesc is open" | Out-File -FilePath $global:scanOptions.OutputFile -Append
                         }
                     }
-                } else {
+                } catch {
                     if (-not $global:scanOptions.OnlyListening -and -not $global:scanOptions.MinimalOutput) {
                         Write-Host "Port $Port$portDesc is closed" -ForegroundColor Red
-                        if ($global:scanOptions.OutputFile) {
-                            "Port $Port$portDesc is closed" | Out-File -FilePath $global:scanOptions.OutputFile -Append
-                        }
                     }
                 }
             } else {
                 if (-not $global:scanOptions.OnlyListening -and -not $global:scanOptions.MinimalOutput) {
                     Write-Host "Port $Port$portDesc timed out" -ForegroundColor Yellow
-                    if ($global:scanOptions.OutputFile) {
-                        "Port $Port$portDesc timed out" | Out-File -FilePath $global:scanOptions.OutputFile -Append
-                    }
                 }
             }
         }
         catch {
             if (-not $global:scanOptions.OnlyListening -and -not $global:scanOptions.MinimalOutput) {
-                $errorMsg = "Error scanning port {0}{1}: {2}" -f $Port, $portDesc, $_.Exception.Message
-                Write-Host $errorMsg -ForegroundColor Red
-                if ($global:scanOptions.OutputFile) {
-                    $errorMsg | Out-File -FilePath $global:scanOptions.OutputFile -Append
-                }
+                Write-Host "Error scanning port $Port$portDesc" -ForegroundColor Red
             }
         }
         finally {
             if ($null -ne $tcpClient) {
-                try {
-                    $tcpClient.Close()
-                    $tcpClient.Dispose()
-                } catch {
-                    # Ignore any errors during cleanup
-                }
+                $tcpClient.Close()
+                $tcpClient.Dispose()
             }
         }
         
-        # Add a small delay between port scans to prevent overwhelming the network
-        Start-Sleep -Milliseconds 10
+        # Add a small delay between port scans
+        Start-Sleep -Milliseconds 20
     }
 
     # Output summary for hosts with open ports
     if ($hasOpenPorts) {
         if ($global:scanOptions.MinimalOutput) {
-            $formattedPorts = $openPorts | ForEach-Object {
-                $port = $_
-                if ($script:portDescriptions.ContainsKey($port)) {
-                    "$port ($($script:portDescriptions[$port]))"
-                } else {
-                    "$port"
-                }
-            }
-            $output = "$HostName : $($formattedPorts -join ', ')"
+            $output = "$HostName : $($results -join ', ')"
             Write-Host $output -ForegroundColor Green
             if ($global:scanOptions.OutputFile) {
                 $output | Out-File -FilePath $global:scanOptions.OutputFile -Append
-            }
-        }
-        elseif ($global:scanOptions.OnlyListening) {
-            Write-Host "`n$HostName is listening:" -ForegroundColor Cyan
-            foreach ($result in $results) {
-                Write-Host $result -ForegroundColor Green
-                if ($global:scanOptions.OutputFile) {
-                    $result | Out-File -FilePath $global:scanOptions.OutputFile -Append
-                }
             }
         }
     }
