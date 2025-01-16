@@ -2,10 +2,12 @@
 
 # Function to print usage
 print_usage() {
-    echo "Usage: $0 <target>"
-    echo "Target can be:"
-    echo "  - Hostname (e.g., example.com)"
-    echo "  - IP address (e.g., 192.168.1.1)"
+    echo "Usage: $0 <input_file>"
+    echo "Input file should contain one host/IP per line"
+    echo "Example file content:"
+    echo "  example.com"
+    echo "  192.168.1.1"
+    echo "  google.com"
     exit 1
 }
 
@@ -17,12 +19,6 @@ days_between() {
     echo $(( ($exp_sec - $today) / 86400 ))
 }
 
-# Check if argument is provided
-if [ $# -ne 1 ]; then
-    print_usage
-fi
-
-HOST=$1
 PORT=443
 
 # Function to check certificate
@@ -98,8 +94,25 @@ check_cert() {
     echo "$HOST,$IP,$PORT,$LEAF_CN,$INTERMEDIATE_ISSUER,$ROOT_ISSUER,$ISSUED,$EXPIRES,$DAYS_LEFT"
 }
 
+# Check if input file is provided
+if [ $# -ne 1 ]; then
+    print_usage
+fi
+
+INPUT_FILE=$1
+
+# Check if file exists
+if [ ! -f "$INPUT_FILE" ]; then
+    echo "Error: File '$INPUT_FILE' not found"
+    exit 1
+fi
+
 # Print CSV header
 echo "Hostname,IP,Port,CommonName,IntermediateIssuer,RootIssuer,IssueDate,ExpirationDate,DaysUntilExpiration"
 
-# Check certificate
-check_cert "$HOST"
+# Process each line in the input file
+while read -r target; do
+    # Skip empty lines and comments
+    [[ -z "$target" || "$target" =~ ^[[:space:]]*# ]] && continue
+    check_cert "$target"
+done < "$INPUT_FILE"
