@@ -1,5 +1,20 @@
 #!/bin/bash
 
+# Trap Ctrl+C and cleanup
+trap cleanup SIGINT
+
+# Global variable to track if we're exiting
+EXITING=0
+
+# Cleanup function
+cleanup() {
+    echo -e "\nReceived interrupt signal. Cleaning up..."
+    EXITING=1
+    # Kill any remaining background processes
+    jobs -p | xargs -r kill > /dev/null 2>&1
+    exit 130
+}
+
 # Function to print usage
 print_usage() {
     echo "Usage: $0 <target>"
@@ -56,7 +71,8 @@ check_cert() {
     local HOST=$1
     local IP
     
-    # If input is hostname, resolve IP, otherwise use IP directly
+    [ $EXITING -eq 1 ] && return
+    
     if [[ $HOST =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$ ]]; then
         IP=$HOST
     else
@@ -66,27 +82,50 @@ check_cert() {
         fi
     fi
 
-    # Test if port 443 is open using timeout to avoid hanging
+    [ $EXITING -eq 1 ] && return
+
     if ! timeout 5 bash -c "echo > /dev/tcp/$HOST/$PORT" 2>/dev/null; then
         echo "$HOST,$IP,$PORT,CLOSED,NA,NA,NA,NA"
         return
     fi
 
-    # Get certificate information using openssl
+    [ $EXITING -eq 1 ] && return
+
     echo | openssl s_client -connect ${HOST}:${PORT} 2>/dev/null | openssl x509 -noout -text | {
         while IFS= read -r line; do
+            [ $EXITING -eq 1 ] && return
+            
             case "$line" in
-                *"Serial Number:"*) SERIAL=$(echo $line | sed 's/.*Serial Number: //') ;;
-                *"Subject: CN"*) CN=$(echo $line | sed 's/.*CN = //') ;;
-                *"Not Before:"*) ISSUED=$(echo $line | sed 's/.*Not Before: //') ;;
-                *"Not After :"*) EXPIRES=$(echo $line | sed 's/.*Not After : //') ;;
+                *"Serial Number:"*) 
+                    SERIAL=$(echo $line | sed 's/.*Serial Number: *//; s/[[:space:]]*$//') 
+                    ;;
+                *"Subject:"*"CN"*) 
+                    CN=$(echo $line | sed -n 's/.*CN[[:space:]]*=[[:space:]]*\([^,]*\).*/\1/p')
+                    ;;
+                *"CN="*) 
+                    CN=$(echo $line | sed -n 's/.*CN=\([^,]*\).*/\1/p')
+                    ;;
+                *"Not Before:"*) 
+                    ISSUED=$(echo $line | sed 's/.*Not Before: *//; s/[[:space:]]*$//') 
+                    ;;
+                *"Not After :"*) 
+                    EXPIRES=$(echo $line | sed 's/.*Not After : *//; s/[[:space:]]*$//') 
+                    ;;
             esac
         done
 
-        # Calculate days until expiration
-        DAYS_LEFT=$(days_between "$EXPIRES")
+        # If CN is still empty, try to get it from subject alternative names
+        if [ -z "$CN" ]; then
+            CN=$(echo | openssl s_client -connect ${HOST}:${PORT} 2>/dev/null | \
+                 openssl x509 -noout -text | \
+                 grep -A1 "Subject Alternative Name" | \
+                 tail -n1 | sed 's/.*DNS://; s/,.*//; s/[[:space:]]*$//')
+        fi
 
-        # Print results in CSV format
+        # If still empty, mark as UNKNOWN
+        CN=${CN:-UNKNOWN}
+        
+        DAYS_LEFT=$(days_between "$EXPIRES")
         echo "$HOST,$IP,$PORT,$CN,$SERIAL,$ISSUED,$EXPIRES,$DAYS_LEFT"
     }
 }
@@ -104,11 +143,9 @@ echo "Hostname,IP,Port,CommonName,SerialNumber,IssueDate,ExpirationDate,DaysUnti
 
 # Check if input is CIDR notation
 if [[ $TARGET =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}/[0-9]{1,2}$ ]]; then
-    # Split CIDR into IP and prefix
     IP_ADDR=${TARGET%/*}
     PREFIX=${TARGET#*/}
     
-    # Validate prefix
     if [ "$PREFIX" -lt 0 ] || [ "$PREFIX" -gt 32 ]; then
         echo "Invalid prefix length. Must be between 0 and 32."
         exit 1
@@ -116,9 +153,13 @@ if [[ $TARGET =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}/[0-9]{1,2}$ ]]; then
     
     # Process each IP in the range
     while read -r ip; do
+        # Check if we're exiting before processing next IP
+        [ $EXITING -eq 1 ] && break
         check_cert "$ip"
     done < <(generate_ip_list "$IP_ADDR" "$PREFIX")
 else
-    # Single host/IP check
     check_cert "$TARGET"
 fi
+
+# Final cleanup if we reach the end normally
+[ $EXITING -eq 1 ] && cleanup
