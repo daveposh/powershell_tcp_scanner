@@ -1,61 +1,12 @@
 #!/bin/bash
 
-# Trap Ctrl+C and cleanup
-trap cleanup SIGINT
-
-# Global variable to track if we're exiting
-EXITING=0
-
-# Cleanup function
-cleanup() {
-    echo -e "\nReceived interrupt signal. Cleaning up..."
-    EXITING=1
-    # Kill any remaining background processes
-    jobs -p | xargs -r kill > /dev/null 2>&1
-    exit 130
-}
-
 # Function to print usage
 print_usage() {
     echo "Usage: $0 <target>"
     echo "Target can be:"
     echo "  - Hostname (e.g., example.com)"
     echo "  - IP address (e.g., 192.168.1.1)"
-    echo "  - IP range in CIDR notation (e.g., 192.168.1.0/24)"
     exit 1
-}
-
-# Function to convert IP to decimal
-ip2dec() {
-    local IFS='.'
-    read -r i1 i2 i3 i4 <<< "$1"
-    echo $(( (i1 << 24) + (i2 << 16) + (i3 << 8) + i4 ))
-}
-
-# Function to convert decimal to IP
-dec2ip() {
-    local ip dec=$1
-    for e in {3..0}; do
-        ((octet = dec / (256 ** e) ))
-        ((dec -= octet * 256 ** e))
-        ip+=$octet
-        [[ $e -gt 0 ]] && ip+=.
-    done
-    echo $ip
-}
-
-# Function to generate IP list from CIDR
-generate_ip_list() {
-    local ip=$1
-    local prefix=$2
-    local ip_hex=$(ip2dec "$ip")
-    local mask=$((0xffffffff << (32 - prefix)))
-    local start=$((ip_hex & mask))
-    local end=$((start | ~mask & 0xffffffff))
-    
-    for ((i=start; i<=end; i++)); do
-        dec2ip $i
-    done
 }
 
 # Function to calculate days between dates
@@ -66,13 +17,20 @@ days_between() {
     echo $(( ($exp_sec - $today) / 86400 ))
 }
 
-# Function to check certificate for a single host
+# Check if argument is provided
+if [ $# -ne 1 ]; then
+    print_usage
+fi
+
+HOST=$1
+PORT=443
+
+# Function to check certificate
 check_cert() {
     local HOST=$1
     local IP
     
-    [ $EXITING -eq 1 ] && return
-    
+    # Get IP if host is not already an IP
     if [[ $HOST =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$ ]]; then
         IP=$HOST
     else
@@ -82,84 +40,66 @@ check_cert() {
         fi
     fi
 
-    [ $EXITING -eq 1 ] && return
-
-    if ! timeout 5 bash -c "echo > /dev/tcp/$HOST/$PORT" 2>/dev/null; then
-        echo "$HOST,$IP,$PORT,CLOSED,NA,NA,NA,NA"
+    # Get certificate chain
+    CERT_DATA=$(openssl s_client -connect ${HOST}:${PORT} -servername ${HOST} -showcerts </dev/null 2>/dev/null)
+    
+    if [ $? -ne 0 ] || [ -z "$CERT_DATA" ]; then
+        echo "$HOST,$IP,$PORT,CLOSED,NA,NA,NA,NA,NA"
         return
     fi
 
-    [ $EXITING -eq 1 ] && return
-
-    echo | openssl s_client -connect ${HOST}:${PORT} 2>/dev/null | openssl x509 -noout -text | {
-        while IFS= read -r line; do
-            [ $EXITING -eq 1 ] && return
-            
-            case "$line" in
-                *"Serial Number:"*) 
-                    SERIAL=$(echo $line | sed 's/.*Serial Number: *//; s/[[:space:]]*$//') 
-                    ;;
-                *"Subject:"*"CN"*) 
-                    CN=$(echo $line | sed -n 's/.*CN[[:space:]]*=[[:space:]]*\([^,]*\).*/\1/p')
-                    ;;
-                *"CN="*) 
-                    CN=$(echo $line | sed -n 's/.*CN=\([^,]*\).*/\1/p')
-                    ;;
-                *"Not Before:"*) 
-                    ISSUED=$(echo $line | sed 's/.*Not Before: *//; s/[[:space:]]*$//') 
-                    ;;
-                *"Not After :"*) 
-                    EXPIRES=$(echo $line | sed 's/.*Not After : *//; s/[[:space:]]*$//') 
-                    ;;
-            esac
-        done
-
-        # If CN is still empty, try to get it from subject alternative names
-        if [ -z "$CN" ]; then
-            CN=$(echo | openssl s_client -connect ${HOST}:${PORT} 2>/dev/null | \
-                 openssl x509 -noout -text | \
-                 grep -A1 "Subject Alternative Name" | \
-                 tail -n1 | sed 's/.*DNS://; s/,.*//; s/[[:space:]]*$//')
+    # Initialize variables
+    LEAF_CN="UNKNOWN"
+    INTERMEDIATE_ISSUER="UNKNOWN"
+    ROOT_ISSUER="UNKNOWN"
+    ISSUED="UNKNOWN"
+    EXPIRES="UNKNOWN"
+    
+    # Process each certificate in the chain
+    cert_count=0
+    while read -r line; do
+        if [[ "$line" == *"-----BEGIN CERTIFICATE-----"* ]]; then
+            cert_data="$line"
+            collecting=1
+            continue
         fi
-
-        # If still empty, mark as UNKNOWN
-        CN=${CN:-UNKNOWN}
         
-        DAYS_LEFT=$(days_between "$EXPIRES")
-        echo "$HOST,$IP,$PORT,$CN,$SERIAL,$ISSUED,$EXPIRES,$DAYS_LEFT"
-    }
+        if [[ "$line" == *"-----END CERTIFICATE-----"* ]]; then
+            cert_data+=$'\n'"$line"
+            cert_count=$((cert_count + 1))
+            
+            # Process based on position in chain
+            if [ $cert_count -eq 1 ]; then
+                # Leaf certificate
+                LEAF_CN=$(echo "$cert_data" | openssl x509 -noout -subject 2>/dev/null | sed -n 's/.*CN *= *\([^,]*\).*/\1/p')
+                DATES=$(echo "$cert_data" | openssl x509 -noout -dates 2>/dev/null)
+                ISSUED=$(echo "$DATES" | grep "notBefore=" | cut -d'=' -f2)
+                EXPIRES=$(echo "$DATES" | grep "notAfter=" | cut -d'=' -f2)
+            elif [ $cert_count -eq 2 ]; then
+                # Intermediate certificate
+                INTERMEDIATE_ISSUER=$(echo "$cert_data" | openssl x509 -noout -subject 2>/dev/null | sed -n 's/.*CN *= *\([^,]*\).*/\1/p')
+            elif [ $cert_count -eq 3 ]; then
+                # Root certificate
+                ROOT_ISSUER=$(echo "$cert_data" | openssl x509 -noout -subject 2>/dev/null | sed -n 's/.*CN *= *\([^,]*\).*/\1/p')
+            fi
+            collecting=0
+            continue
+        fi
+        
+        if [ "$collecting" = "1" ]; then
+            cert_data+=$'\n'"$line"
+        fi
+    done < <(echo "$CERT_DATA" | grep -v "verify" | grep -v "s:" | grep -v "i:" | grep -v "Server certificate" | grep -v "subject=" | grep -v "issuer=")
+
+    # Calculate days until expiration
+    DAYS_LEFT=$(days_between "$EXPIRES")
+
+    # Output in CSV format
+    echo "$HOST,$IP,$PORT,$LEAF_CN,$INTERMEDIATE_ISSUER,$ROOT_ISSUER,$ISSUED,$EXPIRES,$DAYS_LEFT"
 }
 
-# Check if argument is provided
-if [ $# -ne 1 ]; then
-    print_usage
-fi
-
-TARGET=$1
-PORT=443
-
 # Print CSV header
-echo "Hostname,IP,Port,CommonName,SerialNumber,IssueDate,ExpirationDate,DaysUntilExpiration"
+echo "Hostname,IP,Port,CommonName,IntermediateIssuer,RootIssuer,IssueDate,ExpirationDate,DaysUntilExpiration"
 
-# Check if input is CIDR notation
-if [[ $TARGET =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}/[0-9]{1,2}$ ]]; then
-    IP_ADDR=${TARGET%/*}
-    PREFIX=${TARGET#*/}
-    
-    if [ "$PREFIX" -lt 0 ] || [ "$PREFIX" -gt 32 ]; then
-        echo "Invalid prefix length. Must be between 0 and 32."
-        exit 1
-    fi
-    
-    # Process each IP in the range
-    while read -r ip; do
-        # Check if we're exiting before processing next IP
-        [ $EXITING -eq 1 ] && break
-        check_cert "$ip"
-    done < <(generate_ip_list "$IP_ADDR" "$PREFIX")
-else
-    check_cert "$TARGET"
-fi
-
-# Final cleanup if we reach the end normally
-[ $EXITING -eq 1 ] && cleanup
+# Check certificate
+check_cert "$HOST"
